@@ -3,6 +3,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
+import numpy as np
 from tqdm import tqdm
 from PIL import Image
 from torchvision import models
@@ -10,6 +11,7 @@ from pathlib import Path
 from torchvision import transforms
 from sklearn.metrics import accuracy_score
 
+#parameters
 DATA_DIR = Path("./dog-breed-identification")
 OUTPUT_DIR = Path("./outputs"); OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 MODEL_NAME = "efficientnet_b2"
@@ -24,17 +26,18 @@ torch.manual_seed(42)
 
 #split train/val
     #breed轉成數字標籤
-    #先分 不是dataset後 -> 保留完整標籤資訊、方便之後驗證或 ensemble
+    #先分 不是dataset後 -> 保留完整標籤資訊、方便日後驗證或 ensemble
 labels_df = pd.read_csv(DATA_DIR / "labels.csv")  # 兩欄：id, breed
 breeds = sorted(labels_df["breed"].unique())
 breed2idx = {b:i for i,b in enumerate(breeds)} #文字轉成數字標籤（label）
 num_classes = len(breeds)
-print(num_classes) #->120
+print(num_classes)#->120
 
 labels_df["label"] = labels_df["breed"].map(breed2idx)  #_df:"id","breed","label"
 val_df = labels_df.sample(frac=VAL_RATIO, random_state=32)
 train_df = labels_df.drop(val_df.index).reset_index(drop=True)
 val_df = val_df.reset_index(drop=True)
+
 
 #Dataset
 class DogDataset(torch.utils.data.Dataset):
@@ -53,22 +56,38 @@ class DogDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.df)
 
+class TestDataset(torch.utils.data.Dataset):
+    def __init__(self, img_dir, transform):
+        self.img_dir = img_dir
+        self.ids = sorted([p.stem for p in img_dir.glob("*.jpg")])
+        self.transform = transform
+
+    def __getitem__(self, idx):
+        img_id = self.ids[idx]
+        img = Image.open(self.img_dir / f"{img_id}.jpg").convert("RGB")
+        img = self.transform(img)
+        return img_id, img
+
+    def __len__(self):
+        return len(self.ids)
+    
 #transform / 自動配置所需之transform    
 weights = models.EfficientNet_B2_Weights.IMAGENET1K_V1
 #transforms_train = weights.transforms()
 transforms_train = transforms.Compose([
-    transforms.RandomResizedCrop(260, scale=(0.8, 1.0)),
+    #transforms.RandomResizedCrop(260, scale=(0.8, 1.0)),
+    transforms.Resize((260, 260)),
     transforms.RandomHorizontalFlip(p=0.5),
     transforms.ColorJitter(0.2, 0.2, 0.2, 0.02),
     transforms.RandomRotation(10),
     transforms.RandomPerspective(distortion_scale=0.2, p=0.5), 
     transforms.ToTensor(),
     transforms.Normalize((0.485, 0.456, 0.406),(0.229, 0.224, 0.225)),
-     transforms.RandomErasing(p=0.25)
+    #transforms.RandomErasing(p=0.25)
 ])
 transforms_val =transforms.Compose([
-    transforms.Resize(280),
-    transforms.CenterCrop(260), #先放大再切 260，避免變形、讓輸入更穩定
+    transforms.Resize((260, 260)),
+    #transforms.CenterCrop(260), #先放大再切 260，避免變形、讓輸入更穩定
     transforms.ToTensor(),
     transforms.Normalize((0.485,0.456,0.406), (0.229,0.224,0.225)),
     ]) 
@@ -76,11 +95,14 @@ transforms_val =transforms.Compose([
 #DataLoader
 train_dataset = DogDataset(train_df, DATA_DIR/"train", transforms_train)
 val_dataset   = DogDataset(val_df,   DATA_DIR/"train", transforms_val)
+test_dataset   = TestDataset(DATA_DIR/"test",  transforms_val)
 
 train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True,
                           num_workers=NUM_WORKERS)
 val_loader   = torch.utils.data.DataLoader(val_dataset,   batch_size=BATCH_SIZE, shuffle=False,
                           num_workers=NUM_WORKERS)
+test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False,
+                         num_workers=NUM_WORKERS)
 
 #device model loss optimizer
 device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
@@ -135,10 +157,11 @@ def validate(epoch):
         y_pred.extend(tmp_pred.tolist())
     return val_loss/total,y_true,y_pred
 
-#Main
-def main():
+#Train
+def train():
     train_losses, val_losses = [], []
     best_acc=0.0
+    best_loss = float("inf")
 
     for p in model.features.parameters():
         p.requires_grad = False
@@ -161,15 +184,20 @@ def main():
         val_acc=accuracy_score(y_true,y_pred)
         print("val_acc=",val_acc)
 
-        if val_acc > best_acc:
+        if val_loss < best_loss:
+            best_loss = val_loss
             best_acc = val_acc
+
             ckpt = {
                 "model_state": model.state_dict(),
                 "breed2idx": breed2idx,
                 "weights": "EfficientNet_B2_Weights.IMAGENET1K_V1",
+                "best_loss": best_loss,
+                "best_acc": best_acc,
+                "epoch": epoch + 1,
             }
             torch.save(ckpt, OUTPUT_DIR / "efficient_B2_best.pth")
-            print(f"New best: {best_acc:.4f}, saved to outputs/efficient_B2_best.pth")
+            print(f"New best: val_loss={best_loss:.4f}, val_acc={best_acc:.4f} -> saved to outputs/efficient_B2_best.pth")
 
     # 畫 loss 的歷史記錄圖
     plt.plot(range(1, EPOCHS+1), train_losses, label='Train Loss')
@@ -180,10 +208,47 @@ def main():
     plt.title('Training and Validation Loss')
     plt.show()
 
+#Test
+def test():
+    ckpt = torch.load(OUTPUT_DIR / "efficient_B2_best.pth", map_location=device)
+    model.load_state_dict(ckpt["model_state"])
+    model.eval()
+
+    ids, all_probs = [], []
+    softmax = nn.Softmax(dim=1)
+
+    with torch.no_grad():
+        for img_ids, imgs in test_loader:
+            imgs = imgs.to(device)
+
+            outputs = model(imgs)
+            probs1 = softmax(outputs)
+
+            # HFlip TTA
+            imgs_flip = torch.flip(imgs, dims=[3]) # [B,C,H,W] 在 W 維翻轉
+            outputs_flip = model(imgs_flip)
+            probs2 = softmax(outputs_flip)
+
+            probs = 0.5 * (probs1 + probs2)
+
+            ids.extend(img_ids)
+            all_probs.append(probs.cpu().numpy())
+
+    probs = np.concatenate(all_probs, axis=0)   # [N_test, num_classes]
+
+    # 對齊 submission 欄位
+    breed_names_sorted = sorted(breed2idx.keys())
+    col_indices = [breed2idx[b] for b in breed_names_sorted]
+    probs = probs[:, col_indices]
+
+    sub = pd.DataFrame(probs, columns=breed_names_sorted)
+    sub.insert(0, "id", ids)
+
+    sub.to_csv(OUTPUT_DIR / "submission_efficient_B2.csv", index=False)
+    print("Saved submission_efficient_B2.csv")
+
 
 if __name__ == "__main__":
-    main()
+    test()
 
     
-
-
